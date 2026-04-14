@@ -1100,3 +1100,133 @@ def test_cognito_openid_configuration():
     assert pool_id in data["issuer"]
     assert "jwks_uri" in data
     assert "token_endpoint" in data
+
+
+# ---------------------------------------------------------------------------
+# Identity Provider CRUD (#325)
+# ---------------------------------------------------------------------------
+
+def test_cognito_create_identity_provider(cognito_idp):
+    pool = cognito_idp.create_user_pool(PoolName="IdpPool")["UserPool"]
+    pid = pool["Id"]
+    resp = cognito_idp.create_identity_provider(
+        UserPoolId=pid,
+        ProviderName="MySAML",
+        ProviderType="SAML",
+        ProviderDetails={"MetadataURL": "https://idp.example.com/metadata"},
+        AttributeMapping={"email": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"},
+        IdpIdentifiers=["my-idp"],
+    )
+    idp = resp["IdentityProvider"]
+    assert idp["ProviderName"] == "MySAML"
+    assert idp["ProviderType"] == "SAML"
+    assert idp["ProviderDetails"]["MetadataURL"] == "https://idp.example.com/metadata"
+
+
+def test_cognito_describe_identity_provider(cognito_idp):
+    pool = cognito_idp.create_user_pool(PoolName="IdpDescPool")["UserPool"]
+    pid = pool["Id"]
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="MyOIDC", ProviderType="OIDC",
+        ProviderDetails={"client_id": "abc", "authorize_scopes": "openid"},
+    )
+    resp = cognito_idp.describe_identity_provider(UserPoolId=pid, ProviderName="MyOIDC")
+    assert resp["IdentityProvider"]["ProviderName"] == "MyOIDC"
+    assert resp["IdentityProvider"]["ProviderType"] == "OIDC"
+
+
+def test_cognito_list_identity_providers(cognito_idp):
+    pool = cognito_idp.create_user_pool(PoolName="IdpListPool")["UserPool"]
+    pid = pool["Id"]
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="IdpA", ProviderType="SAML", ProviderDetails={})
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="IdpB", ProviderType="OIDC", ProviderDetails={})
+    resp = cognito_idp.list_identity_providers(UserPoolId=pid)
+    names = [p["ProviderName"] for p in resp["Providers"]]
+    assert "IdpA" in names
+    assert "IdpB" in names
+
+
+def test_cognito_update_identity_provider(cognito_idp):
+    pool = cognito_idp.create_user_pool(PoolName="IdpUpdPool")["UserPool"]
+    pid = pool["Id"]
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="UpdIdp", ProviderType="SAML",
+        ProviderDetails={"MetadataURL": "https://old.example.com"},
+    )
+    resp = cognito_idp.update_identity_provider(
+        UserPoolId=pid, ProviderName="UpdIdp",
+        ProviderDetails={"MetadataURL": "https://new.example.com"},
+    )
+    assert resp["IdentityProvider"]["ProviderDetails"]["MetadataURL"] == "https://new.example.com"
+
+
+def test_cognito_delete_identity_provider(cognito_idp):
+    pool = cognito_idp.create_user_pool(PoolName="IdpDelPool")["UserPool"]
+    pid = pool["Id"]
+    cognito_idp.create_identity_provider(
+        UserPoolId=pid, ProviderName="DelIdp", ProviderType="SAML", ProviderDetails={})
+    cognito_idp.delete_identity_provider(UserPoolId=pid, ProviderName="DelIdp")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.describe_identity_provider(UserPoolId=pid, ProviderName="DelIdp")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# AdminGetUser by sub UUID (#326)
+# ---------------------------------------------------------------------------
+
+def test_cognito_admin_get_user_by_sub(cognito_idp):
+    pool = cognito_idp.create_user_pool(PoolName="SubLookupPool")["UserPool"]
+    pid = pool["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="subuser@test.com",
+        UserAttributes=[{"Name": "email", "Value": "subuser@test.com"}],
+    )
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="subuser@test.com")
+    sub = next(a["Value"] for a in user["UserAttributes"] if a["Name"] == "sub")
+    # Look up by sub UUID
+    user2 = cognito_idp.admin_get_user(UserPoolId=pid, Username=sub)
+    assert user2["Username"] == "subuser@test.com"
+
+
+# ---------------------------------------------------------------------------
+# IdToken attributes and aud claim (#327)
+# ---------------------------------------------------------------------------
+
+def test_cognito_id_token_has_aud_and_attributes(cognito_idp):
+    import base64
+    pool = cognito_idp.create_user_pool(PoolName="TokenPool")["UserPool"]
+    pid = pool["Id"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="tok-client",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]
+    cid = client["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="tokuser@test.com",
+        UserAttributes=[{"Name": "email", "Value": "tokuser@test.com"}],
+        TemporaryPassword="Temp1234!",
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="tokuser@test.com",
+        Password="Real1234!", Permanent=True,
+    )
+    auth = cognito_idp.initiate_auth(
+        AuthFlow="USER_PASSWORD_AUTH", ClientId=cid,
+        AuthParameters={"USERNAME": "tokuser@test.com", "PASSWORD": "Real1234!"},
+    )
+    id_token = auth["AuthenticationResult"]["IdToken"]
+    # Decode the JWT payload
+    payload_b64 = id_token.split(".")[1]
+    payload_b64 += "=" * (4 - len(payload_b64) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+    # Must have 'aud' not 'client_id'
+    assert "aud" in claims, f"IdToken missing 'aud' claim: {list(claims.keys())}"
+    assert claims["aud"] == cid
+    assert "client_id" not in claims
+    # Must have user attributes
+    assert claims.get("email") == "tokuser@test.com"
+    assert "cognito:username" in claims
+    assert "auth_time" in claims
