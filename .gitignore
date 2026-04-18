@@ -41,6 +41,7 @@ htmlcov/
 
 # Docker
 data/
+docker-compose.override.yml
 
 # Secrets / local config
 .env
