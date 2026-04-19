@@ -1392,6 +1392,158 @@ def test_cfn_dynamodb_stream_spec(cfn, ddb):
     _wait_stack(cfn, stack_name)
 
 
+def test_cfn_pipes_dynamodb_stream_to_sns(cfn, ddb, sqs):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-pipe-{uid}"
+    table_name = f"cfn-pipe-table-{uid}"
+    queue_name = f"cfn-pipe-q-{uid}"
+    topic_name = f"cfn-pipe-topic-{uid}"
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "PipeTable": {
+                "Type": "AWS::DynamoDB::Table",
+                "Properties": {
+                    "TableName": table_name,
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST",
+                    "StreamSpecification": {"StreamViewType": "NEW_AND_OLD_IMAGES"},
+                },
+            },
+            "PipeTopic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": topic_name},
+            },
+            "PipeQueue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": queue_name},
+            },
+            "PipeSubscription": {
+                "Type": "AWS::SNS::Subscription",
+                "Properties": {
+                    "Protocol": "sqs",
+                    "TopicArn": {"Ref": "PipeTopic"},
+                    "Endpoint": {"Fn::GetAtt": ["PipeQueue", "Arn"]},
+                },
+            },
+            "DdbToSnsPipe": {
+                "Type": "AWS::Pipes::Pipe",
+                "Properties": {
+                    "Name": f"{stack_name}-pipe",
+                    "RoleArn": "arn:aws:iam::000000000000:role/test-pipe-role",
+                    "Source": {"Fn::GetAtt": ["PipeTable", "StreamArn"]},
+                    "Target": {"Ref": "PipeTopic"},
+                    "SourceParameters": {
+                        "DynamoDBStreamParameters": {"StartingPosition": "TRIM_HORIZON"}
+                    },
+                },
+            },
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    queue_url = sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+
+    ddb.put_item(
+        TableName=table_name,
+        Item={
+            "pk": {"S": "1"},
+            "val": {"S": "hello"},
+        },
+    )
+
+    msg = None
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        out = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+        msgs = out.get("Messages", [])
+        if msgs:
+            msg = msgs[0]
+            break
+
+    assert msg is not None, "Expected DynamoDB stream record to reach SNS/SQS via Pipe"
+
+    envelope = json.loads(msg["Body"])
+    rec = json.loads(envelope["Message"])
+    assert rec.get("eventSource") == "aws:dynamodb"
+    assert rec.get("eventName") in ("INSERT", "MODIFY", "REMOVE")
+
+    dynamodb  = rec.get("dynamodb", {})
+    assert dynamodb.get("Keys", {}).get("pk", {}).get("S") == "1"
+    assert dynamodb.get("NewImage", {}).get("pk", {}).get("S") == "1"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+
+
+def test_cfn_sns_topic_subscription_filter_policy_scope(cfn, sns, sqs):
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-sns-filter-{uid}"
+    queue_name = f"cfn-sns-filter-q-{uid}"
+    topic_name = f"cfn-sns-filter-topic-{uid}"
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "FilterQueue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": queue_name},
+            },
+            "FilterTopic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {
+                    "TopicName": topic_name,
+                },  
+            },
+            "FilterSubscription": {
+                "Type": "AWS::SNS::Subscription",
+                "Properties": {
+                    "Protocol": "sqs",
+                    "TopicArn": {"Ref": "FilterTopic"},
+                    "Endpoint": {"Fn::GetAtt": ["FilterQueue", "Arn"]},
+                    "FilterPolicy": {"color": ["blue"]},
+                },
+            },
+        },
+        "Outputs": {
+            "TopicArn": {"Value": {"Ref": "FilterTopic"}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    topic_arn = outputs["TopicArn"]
+    queue_url = sqs.get_queue_url(QueueName=queue_name)["QueueUrl"]
+
+    sns.publish(
+        TopicArn=topic_arn,
+        Message="red message",
+        MessageAttributes={"color": {"DataType": "String", "StringValue": "red"}},
+    )
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=0)
+    assert len(msgs.get("Messages", [])) == 0
+
+    sns.publish(
+        TopicArn=topic_arn,
+        Message="blue message",
+        MessageAttributes={"color": {"DataType": "String", "StringValue": "blue"}},
+    )
+    msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=1)
+    assert len(msgs.get("Messages", [])) == 1
+    body = json.loads(msgs["Messages"][0]["Body"])
+    assert body["Message"] == "blue message"
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    
 # ===========================================================================
 # CodeBuild Project Tests
 # ===========================================================================

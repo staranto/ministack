@@ -162,6 +162,7 @@ SERVICE_HANDLERS = {
     "appconfigdata": _lazy_handler("appconfig"),
     "scheduler": _lazy_handler("scheduler"),
     "eks": _lazy_handler("eks"),
+    "tagging": _lazy_handler("tagging"),
 }
 
 SERVICE_NAME_ALIASES = {
@@ -315,6 +316,15 @@ async def app(scope, receive, send):
         lp = path.split("/")  # ['', '_ministack', 'lambda-layers', name, ver, 'content']
         if len(lp) >= 6 and lp[5] == "content" and lp[4].isdigit():
             status, resp_headers, resp_body = _get_module("lambda_svc").serve_layer_content(lp[3], int(lp[4]))
+            await _send_response(send, status, resp_headers, resp_body)
+            return
+
+    # Lambda function code download (pre-signed-style URL target for
+    # GetFunction's Code.Location): /_ministack/lambda-code/{fn}
+    if path.startswith("/_ministack/lambda-code/") and method == "GET":
+        lp = path.split("/")  # ['', '_ministack', 'lambda-code', fn]
+        if len(lp) >= 4:
+            status, resp_headers, resp_body = _get_module("lambda_svc").serve_function_code(lp[3])
             await _send_response(send, status, resp_headers, resp_body)
             return
 
@@ -883,6 +893,7 @@ def _reset_all_state():
         "emr", "alb", "acm", "ses_v2", "waf", "efs", "cloudformation", "kms",
         "cloudfront", "codebuild", "ecr", "appsync", "servicediscovery",
         "rds_data", "s3files", "appconfig", "transfer", "scheduler", "autoscaling", "eks", "iam",
+        "pipes"
     ]
     for mod_name in _ALL_SERVICE_MODULES:
         if mod_name in _loaded_modules:

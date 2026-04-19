@@ -427,6 +427,7 @@ def _create_db_instance(p):
         "_docker_container_id": docker_container_id,
         "_internal_address": internal_host,
         "_internal_port": internal_port,
+        "_MasterUserPassword": master_pass,
     }
     _instances[db_id] = instance
 
@@ -488,6 +489,60 @@ def _describe_db_instances(p):
         f"<DescribeDBInstancesResult><DBInstances>{members}</DBInstances></DescribeDBInstancesResult>")
 
 
+def _rotate_instance_password(instance, old_pass, new_pass):
+    """Alter the root password on the real DB container for a standalone instance."""
+    db_id = instance.get("DBInstanceIdentifier", "")
+    engine = instance.get("Engine", "")
+    host = instance.get("_internal_address")
+    port = instance.get("_internal_port")
+    if not host or not port:
+        endpoint = instance.get("Endpoint", {})
+        if not isinstance(endpoint, dict) or not endpoint.get("Port"):
+            return
+        host = endpoint.get("Address", "localhost")
+        port = int(endpoint.get("Port", 3306))
+    if any(e in engine for e in ("mysql", "aurora-mysql", "mariadb")):
+        try:
+            import pymysql
+            conn = pymysql.connect(
+                host=host, port=port, user="root",
+                password=old_pass, autocommit=True)
+            cur = conn.cursor()
+            cur.execute(
+                "ALTER USER 'root'@'%%' IDENTIFIED BY %s", (new_pass,))
+            cur.close()
+            conn.close()
+            logger.info("RDS: rotated root password on instance %s", db_id)
+        except Exception as e:
+            # Error (not warning) — the stored master password no longer matches
+            # the real DB container, so follow-up connections will fail.
+            logger.error("RDS: password rotation failed on instance %s: %s",
+                         db_id, e)
+    elif any(e in engine for e in ("postgres", "aurora-postgresql")):
+        try:
+            import psycopg2
+            from psycopg2 import sql as _pgsql
+            master_user = instance.get("MasterUsername", "admin")
+            conn = psycopg2.connect(
+                host=host, port=port, user=master_user,
+                password=old_pass, dbname=instance.get("DBName", "postgres"))
+            conn.autocommit = True
+            cur = conn.cursor()
+            # Use psycopg2.sql.Identifier to quote the role name safely — AsIs
+            # skips quoting entirely and is a SQL-injection hazard when
+            # MasterUsername comes from user input.
+            cur.execute(
+                _pgsql.SQL("ALTER USER {role} WITH PASSWORD %s").format(
+                    role=_pgsql.Identifier(master_user)),
+                (new_pass,))
+            cur.close()
+            conn.close()
+            logger.info("RDS: rotated password on instance %s", db_id)
+        except Exception as e:
+            logger.error("RDS: password rotation failed on instance %s: %s",
+                         db_id, e)
+
+
 def _modify_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
@@ -535,6 +590,12 @@ def _modify_db_instance(p):
             instance[instance_key] = val
         else:
             pending[instance_key] = val
+
+    new_pass = _p(p, "MasterUserPassword")
+    if new_pass:
+        old_pass = instance.get("_MasterUserPassword", "password")
+        instance["_MasterUserPassword"] = new_pass
+        _rotate_instance_password(instance, old_pass, new_pass)
 
     if _p(p, "DBParameterGroupName"):
         instance["DBParameterGroups"] = [{
