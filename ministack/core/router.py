@@ -214,20 +214,21 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"eks\."],
         "credential_scope": "eks",
     },
-    "resource-groups": {
-        "host_patterns": [r"resource-groups\."],
-        "path_prefixes": ["/groups", "/get-group", "/delete-group",
-                          "/update-group", "/get-group-query",
-                          "/update-group-query", "/get-group-configuration",
-                          "/put-group-configuration", "/group-resources",
-                          "/ungroup-resources", "/list-group-resources",
-                          "/groups-list", "/resources-search", "/resources"],
-        "credential_scope": "resource-groups",
-    },
     "tagging": {
         "target_prefixes": ["ResourceGroupsTaggingAPI_20170126"],
         "host_patterns": [r"tagging\."],
         "credential_scope": "tagging",
+    },
+    "resource-groups": {
+        "host_patterns": [r"resource-groups\."],
+        "path_prefixes": ["/delete-group", "/get-group",
+                          "/get-group-configuration", "/get-group-query",
+                          "/group-resources", "/groups", "/groups-list",
+                          "/list-group-resources", "/put-group-configuration",
+                          "/resources", "/resources-search",
+                          "/ungroup-resources", "/update-group",
+                          "/update-group-query"],
+        "credential_scope": "resource-groups",
     },
 }
 
